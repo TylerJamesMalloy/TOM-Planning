@@ -28,10 +28,11 @@ def best_first_search(policy_net, transition_net, obs, mask, args):
 
         transition_in = np.concatenate((obs, action))
         with th.no_grad(): trans_out = transition_net(th.from_numpy(transition_in).float().to(args.device)).cpu().numpy()
-        done = trans_out[-2]
+        done = trans_out[-1]
+        reward = trans_out[-2]
         mask = trans_out[len(obs[0]):-2]
         obs = trans_out[:obs.shape[0]]
-        reward = trans_out[-1]
+       
 
         current_q += current_gamma * reward
         current_gamma *= args.gamma 

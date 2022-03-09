@@ -1,10 +1,11 @@
 import os 
 
 
-for model_id in range(1,101):
-    for player_id in range(0,4):
-        print("model id: ", str(model_id), " player id: ", player_id)
-        os.system("python train.py --compare --load_folder ./trained_models/liarsdice/DQN_1H/models-" + str(model_id) + "/ --opponent ./trained_models/liarsdice/DQN_1M/models-10 --timesteps 1000 --compare_folder ./results --player_id " + str(player_id))
+for model_id in range(0,101):
+    print("model id: ", str(model_id))
+    for player_id in range(0,2):
+        call = "python train.py --compare --model_type MADQN --load_folder ./trained_models/tiktaktoe/MADQN_10K/models-" + str(model_id) + "/ --opponent ./trained_models/tiktaktoe/MADQN_10K/models-100/ --timesteps 100 " + " --player_id " + str(player_id)
+        os.system(call)
 
-
-# python train.py --compare --load_folder ./trained_models/liarsdice/DQN_100K/models-1/ --opponent ./trained_models/liarsdice/DQN_1M/models-10 --timesteps 1000 --compare_folder ./results --player_id 0
+        call = "python train.py --compare --model_type MADQN --load_folder ./trained_models/tiktaktoe/MADQN_10K/models-" + str(model_id) + "/ --opponent random --timesteps 100  " + " --player_id " + str(player_id)
+        os.system(call)

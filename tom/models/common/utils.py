@@ -23,7 +23,7 @@ class ReplayBuffer():
         self.masks = np.zeros((self.buffer_size, self.n_envs) + action_shape, dtype=np.int8)
         self.next_mask = np.zeros((self.buffer_size, self.n_envs) + action_shape, dtype=np.int8)
         self.actions = np.zeros((self.buffer_size, self.n_envs, 1), dtype=np.int64)
-        self.rewards = np.zeros((self.buffer_size, self.n_envs), dtype=np.int8)
+        self.rewards = np.zeros((self.buffer_size, self.n_envs), dtype=np.float16)
         self.dones = np.zeros((self.buffer_size, self.n_envs), dtype=np.int8)
         self.handle_timeout_termination = handle_timeout_termination
         self.pos = 0
@@ -79,14 +79,14 @@ class ReplayBuffer():
         device = th.device("cuda" if th.cuda.is_available() else "cpu")
         return th.from_numpy(input).to(device)
 
-"""
-class ReplayBuffer():
+class TOMReplayBuffer():
     def __init__(
         self,
         buffer_size: int,
         observation_shape: tuple,
         action_shape: tuple,
         belief_shape: tuple,
+        num_agents: int,
         handle_timeout_termination: bool = True,
 
     ):
@@ -98,7 +98,7 @@ class ReplayBuffer():
         self.masks = np.zeros((self.buffer_size, self.n_envs) + action_shape, dtype=np.int32)
         self.next_mask = np.zeros((self.buffer_size, self.n_envs) + action_shape, dtype=np.int32)
         self.actions = np.zeros((self.buffer_size, self.n_envs, 1), dtype=np.int64)
-        self.prev_actions = np.zeros((self.buffer_size, self.n_envs, 1), dtype=np.int64)
+        self.prev_actions = np.zeros((self.buffer_size, self.n_envs, num_agents), dtype=np.int64)
         self.prev_beliefs = np.zeros((self.buffer_size, self.n_envs) + belief_shape, np.int32) 
         self.rewards = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.dones = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
@@ -166,4 +166,3 @@ class ReplayBuffer():
     def to_torch(self, input):
         device = th.device("cuda" if th.cuda.is_available() else "cpu")
         return th.from_numpy(input).to(device)
-"""

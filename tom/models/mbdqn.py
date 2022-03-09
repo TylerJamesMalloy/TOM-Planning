@@ -2,6 +2,8 @@ import os
 
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
+import pandas
+
 import gym
 import numpy as np
 import torch as th
@@ -10,13 +12,16 @@ from torch import nn
 import torch.optim as optim
 
 from tqdm import tqdm
+import copy
 
 from argparse import ArgumentParser
-from tom.models.common.networks import Policy, Transition, Attention, Belief, RewardDone, Mask, MLP
-from tom.models.common.utils import TOMReplayBuffer
+from tom.models.common.networks import Policy, Transition, RewardDone, Mask, MLP
+from tom.models.common.utils import ReplayBuffer
 from tom.models.common.tree_search import best_first_search
 
-class MATOM():
+
+
+class MBDQN():
     """
     Deep Model-Based Q-Network (MADQN)
     """
@@ -37,10 +42,6 @@ class MATOM():
 
         self.observation_size = np.prod(self.observation_shape)
         self.action_size      = self.action_space.n
-        self.belief_size = self.observation_size * (self.num_agents ** 2)
-
-        self.num_objects = self.env.num_objects
-        self.attention_size = args.attention_size 
         
         self.model_based = args.model_based
         self.device = args.device
@@ -56,48 +57,35 @@ class MATOM():
 
         self.prev_mask = [None for _ in env.agents]
         self.prev_obs  = [None for _ in env.agents]
-        self.prev_beliefs = [np.zeros((self.belief_size)) for _ in env.agents]
         self.prev_action  = [None for _ in env.agents]
         self.prev_rew  = [None for _ in env.agents]
-        self.prev_acts = [0 for _ in env.agents]
         
 
-        self.replay_buffer = TOMReplayBuffer(   buffer_size=int(1e6), 
-                                                observation_shape=self.observation_size, 
-                                                action_shape=(self.action_size,),
-                                                belief_shape=(self.belief_size),
-                                                num_agents=self.num_agents)
-
-        # belief net takes in current observation and each players previous actions, outputs full beliefs for all players
-        self.belief_net = Belief(input_size= self.belief_size + (self.action_size * self.num_agents), output_size=self.belief_size, layers=args.layers).to(self.args.device)
-        self.attention_net = Attention(input_size=self.observation_size * (self.num_agents ** 2), output_size=self.num_objects * self.num_agents , layers=args.layers).to(self.args.device) 
+        self.replay_buffer = ReplayBuffer(  buffer_size=int(1e6), 
+                                            observation_shape=self.observation_size, 
+                                            action_shape=(self.action_size,),
+                                            belief_shape=())
         
         self.policy_net = Policy(input_size=self.observation_size, output_size=self.action_size, layers=args.layers).to(self.args.device)
         self.target_net = Policy(input_size=self.observation_size, output_size=self.action_size, layers=args.layers).to(self.args.device)
-        
-        # TODO: combine the following into one net 
         self.transition_net = Transition(input_size=self.observation_size + self.action_size, output_size=self.observation_size , layers=args.layers).to(self.args.device)
         self.mask_net = Mask(input_size=self.observation_size + self.action_size, output_size= self.action_size, layers=args.layers).to(self.args.device)
         self.rewarddone_net = RewardDone(input_size=self.observation_size + self.action_size, layers=args.layers).to(self.args.device)
-        self.loss_log = []
-
-        self.nets = [self.belief_net, self.attention_net, self.policy_net, self.transition_net, self.mask_net, self.rewarddone_net]
 
         if(os.path.exists(args.base_model + 'policy')): 
-            assert(False) # not working yet
             self.policy_net.load_state_dict(th.load(args.base_model + 'policy'))
             self.target_net.load_state_dict(th.load(args.base_model + 'policy'))
             self.transition_net.load_state_dict(th.load(args.base_model + 'transition'))
             self.rewarddone_net.load_state_dict(th.load(args.base_model + 'rewarddone'))
             self.mask_net.load_state_dict(th.load(args.base_model + 'mask_net'))
-            self.b
             self.policy_net.eval()
             self.target_net.eval()
             self.transition_net.eval()
             self.rewarddone_net.eval()
             self.mask_net.eval()
-        
-        self.all_parameters = list(self.policy_net.parameters()) + list(self.transition_net.parameters()) + list(self.rewarddone_net.parameters()) + list(self.mask_net.parameters()) + list(self.belief_net.parameters()) + list(self.attention_net.parameters())
+
+
+        self.all_parameters = list(self.policy_net.parameters()) + list(self.transition_net.parameters()) + list(self.rewarddone_net.parameters()) + list(self.mask_net.parameters())
         self.optimizer = optim.Adam(self.all_parameters, lr=args.learning_rate)
     
     def learn(self, total_timesteps):
@@ -112,40 +100,32 @@ class MATOM():
             player_index = self.env.agents.index(env.agent_selection)
             obs = env.observe(agent=env.agent_selection)['observation'].flatten().astype(np.float32)
             mask = env.observe(agent=env.agent_selection)['action_mask']
-            prev_acts_ohe = np.array([np.eye(self.action_size)[prev_act] for prev_act in self.prev_acts ]).flatten()
-            beliefs = np.concatenate((self.prev_beliefs[player_index], prev_acts_ohe))
-            print(beliefs.dtype)
-            beliefs = self.prev_beliefs[player_index] = self.belief_net(th.from_numpy(beliefs).to(self.args.device)).cpu().numpy()
 
-            action = self.predict(obs=obs, mask=mask, beliefs=beliefs)
+            action = self.predict(obs=obs, mask=mask)
             env.step(action) 
             
             rew_n, done_n, info_n = list(env.rewards.values()), list(env.dones.values()), list(env.infos.values())
             obs_n = [env.observe(agent=agent_id)['observation'].flatten().astype(np.float32) for agent_id in self.env.agents]
-            
 
             if(self.prev_rew[player_index] is not None):
-                self.observe(self.prev_obs[player_index], obs, self.prev_acts[player_index], self.prev_mask[player_index], mask, self.prev_rew[player_index], done_n[player_index], info_n[player_index])
+                self.observe(self.prev_obs[player_index], obs, self.prev_action[player_index], self.prev_mask[player_index], mask, self.prev_rew[player_index], done_n[player_index], info_n[player_index])
             
-            self.prev_obs[player_index]     = obs
-            self.prev_mask[player_index]    = mask
-            self.prev_action[player_index]  = action 
-            self.prev_rew[player_index]     = rew_n[player_index]
-            self.prev_acts[player_index]    = [self.prev_action[p_i] for p_i in range(self.num_agents)] # opponent previous acts from the perspective of the current player 
-            self.prev_beliefs[player_index] = beliefs
+            self.prev_obs[player_index]    = obs
+            self.prev_mask[player_index]   = mask
+            self.prev_action[player_index] = action 
+            self.prev_rew[player_index]    = rew_n[player_index]
 
             self.on_step()
 
             if all(done_n):
                 for agent_index in range(self.num_agents):
                     mask = env.observe(agent=env.agents[agent_index])['action_mask']
-                    self.observe(self.prev_obs[agent_index], obs_n[agent_index], self.prev_acts[agent_index], self.prev_mask[agent_index], mask, rew_n[agent_index], done_n[agent_index], info_n[agent_index])
+                    self.observe(self.prev_obs[agent_index], obs_n[agent_index], self.prev_action[agent_index], self.prev_mask[agent_index], mask, rew_n[agent_index], done_n[agent_index], info_n[agent_index])
                 env.reset() 
                 self.prev_mask = [None for _ in env.agents]
                 self.prev_obs  = [None for _ in env.agents]
                 self.prev_action  = [None for _ in env.agents]
                 self.prev_rew  = [None for _ in env.agents]
-                self.prev_acts = [None for _ in env.agents]
 
                 
     def observe(self, obs, obs_next, action, mask, mask_next, reward, done, info):
@@ -158,15 +138,11 @@ class MATOM():
         self.training_step += 1
         (obs, next_obs, acts, masks, next_masks, dones, rewards) = self.replay_buffer.sample(self.batch_size, self.env)
         
-        print(acts.size())
-        assert(False)
         rewards = rewards.float().squeeze() 
         masks = masks.float().squeeze()
         dones = dones.float().squeeze()
         next_masks = next_masks.float().squeeze()
         next_obs = next_obs.float().squeeze()
-
-        self.belief_net()
 
         acts_ohe = F.one_hot(acts, num_classes=self.action_size).squeeze()
         trans_in = th.cat((obs, acts_ohe), 1).float()
@@ -190,8 +166,13 @@ class MATOM():
         state_action_values = self.policy_net(obs.float()).gather(dim=1, index=acts).squeeze()
         # Compute V(s_{t+1})
         next_state_values = th.zeros(self.batch_size, device=self.device)
-        if(non_final_next_obs_pred.size()[0] > 0):
-            masked_next_state_values = self.target_net(non_final_next_obs_pred.float()) * non_final_next_masks_pred
+        non_final_size = non_final_next_obs_pred.size()[0]
+        if( non_final_size> 0):
+            # max besides zeroed out values 
+            masked_next_state_values = self.target_net(non_final_next_obs_pred.float()) 
+            masked_next_state_values -= masked_next_state_values.min(1, keepdim=True)[0]
+            masked_next_state_values /= masked_next_state_values.max(1, keepdim=True)[0] # normalize to between 0 and 1 
+            masked_next_state_values *= non_final_next_masks_pred
             next_state_values[non_final_mask] = masked_next_state_values.max(1).values.detach() 
 
         # Compute the expected Q values
@@ -235,7 +216,7 @@ class MATOM():
                         if(mask[mask_index] == 0): continue 
                         masked_q_values[mask_index] += q_values[mask_index]
                     action = np.argmax(masked_q_values)
-            
+        
         return action
 
      
@@ -306,5 +287,3 @@ class MATOM():
                 eps_rewards = np.zeros(len(self.env.agents))
         
         return cum_rewards
-
-

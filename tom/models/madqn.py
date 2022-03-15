@@ -15,7 +15,7 @@ from tqdm import tqdm
 import copy
 
 from argparse import ArgumentParser
-from tom.models.common.networks import MLP
+from tom.models.common.networks import Policy
 from tom.models.common.utils import ReplayBuffer
 from tom.models.common.tree_search import best_first_search
 
@@ -46,7 +46,7 @@ class MADQN():
         self.layers = args.layers
         self.model_type = args.model_type
         self.e_min = 0.05
-        self.e = 0.1 # start at 10% exploration 
+        self.e = 1 # start at 100% exploration 
         self.training_step = 0
         self.results = pandas.DataFrame()
 
@@ -62,8 +62,8 @@ class MADQN():
                                             action_shape=(self.action_size,),
                                             belief_shape=())
         
-        self.policy_net = MLP(input_size=self.observation_size + self.action_size, output_size=self.action_size, layers=args.layers).to(self.args.device)
-        self.target_net = MLP(input_size=self.observation_size + self.action_size, output_size=self.action_size, layers=args.layers).to(self.args.device)
+        self.policy_net = Policy(input_size=self.observation_size + self.action_size, output_size=self.action_size, layers=args.layers).to(self.args.device)
+        self.target_net = Policy(input_size=self.observation_size + self.action_size, output_size=self.action_size, layers=args.layers).to(self.args.device)
         
         if(os.path.exists(args.base_model + 'policy')): 
             print("loading base policy")
@@ -83,7 +83,7 @@ class MADQN():
         cum_rewards = []
         eps_rewards = np.zeros(len(self.env.agents))
 
-        for _ in range(1000):
+        for _ in range(10000):
             player_key = env.agent_selection
             player_index = env.agents.index(env.agent_selection)
 
@@ -121,6 +121,7 @@ class MADQN():
                 if len(self.losses) > 0:
                     total_loss = np.mean(self.losses) 
                     reward_performance = self.reward_performance()
+                    # not done correctly 
                     d = {"loss": total_loss, "performance": reward_performance, "learning_timestep":learning_timestep}
                     d = pandas.Series(data=d, index=['loss', 'performance', 'learning_timestep'])
                     print(d)
@@ -248,13 +249,13 @@ class MADQN():
 
     def compare(self, args):
         # load_folder=args.load_folder, opponent=args.opponent
-        self.policy_net = MLP(input_size=self.observation_size, output_size=self.action_size, layers=args.layers).to(self.args.device)
+        self.policy_net = Policy(input_size=self.observation_size, output_size=self.action_size, layers=args.layers).to(self.args.device)
         self.policy_net.load_state_dict(th.load(args.load_folder + 'policy'))
         self.policy_net.eval()
         self.e = 0 
 
         if(self.args.opponent != "random"):
-            opponent = MLP(input_size=self.observation_size, output_size=self.action_size, layers=args.layers).to(self.args.device)
+            opponent = Policy(input_size=self.observation_size, output_size=self.action_size, layers=args.layers).to(self.args.device)
             opponent.load_state_dict(th.load(args.opponent + 'policy'))
             opponent.eval()
 

@@ -4,6 +4,23 @@ import seaborn as sns
 import matplotlib.pyplot as plt 
 import os 
 
+
+
+all_data = pd.DataFrame()
+data = pd.read_pickle('./trained_models/connect_four/MADQN_1M/results.pkl')
+np_data = data.to_numpy()
+for data_index, datapoint in enumerate(np_data):
+    if((data_index - 1) % 3 == 0):
+        d = {"Performance": np_data[data_index][0], "Timesteps": np_data[data_index + 1][0], "Loss": np_data[data_index - 1][0]}
+        all_data = all_data.append(d, ignore_index=True)
+
+
+print(all_data)
+
+sns.lineplot(x='Timesteps', y='Performance', data=all_data)
+plt.show()
+
+assert(False)
 MODEL = "MADQN_10K"
 ENV = "tiktaktoe"
 

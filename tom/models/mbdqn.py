@@ -15,7 +15,7 @@ from tqdm import tqdm
 import copy
 
 from argparse import ArgumentParser
-from tom.models.common.networks import Policy, Transition, RewardDone, Mask, MLP
+from tom.models.common.networks import Policy, Transition 
 from tom.models.common.utils import ReplayBuffer
 from tom.models.common.tree_search import best_first_search
 
@@ -43,7 +43,7 @@ class MBDQN():
         self.observation_size = np.prod(self.observation_shape)
         self.action_size      = self.action_space.n
         
-        self.model_based = args.model_based
+        self.planning = args.planning
         self.device = args.device
         self.gamma = args.gamma
         self.batch_size = args.batch_size
@@ -51,7 +51,7 @@ class MBDQN():
         self.layers = args.layers
         self.model_type = args.model_type
         self.e_min = 0.05
-        self.e = 0.1 # start at 10% exploration 
+        self.e = 1 # start at 100% exploration 
         self.training_step = 0
         self.loss_log = []
 
@@ -61,31 +61,24 @@ class MBDQN():
         self.prev_rew  = [None for _ in env.agents]
         
 
-        self.replay_buffer = ReplayBuffer(  buffer_size=int(1e6), 
+        self.replay_buffer = ReplayBuffer(  buffer_size=int(1e5), 
                                             observation_shape=self.observation_size, 
                                             action_shape=(self.action_size,),
                                             belief_shape=())
         
-        self.policy_net = Policy(input_size=self.observation_size, output_size=self.action_size, layers=args.layers).to(self.args.device)
-        self.target_net = Policy(input_size=self.observation_size, output_size=self.action_size, layers=args.layers).to(self.args.device)
-        self.transition_net = Transition(input_size=self.observation_size + self.action_size, output_size=self.observation_size , layers=args.layers).to(self.args.device)
-        self.mask_net = Mask(input_size=self.observation_size + self.action_size, output_size= self.action_size, layers=args.layers).to(self.args.device)
-        self.rewarddone_net = RewardDone(input_size=self.observation_size + self.action_size, layers=args.layers).to(self.args.device)
-
+        self.policy_net = Policy(input_size=self.observation_size + self.action_size, output_size=self.action_size, layers=args.layers).to(self.args.device)
+        self.target_net = Policy(input_size=self.observation_size + self.action_size, output_size=self.action_size, layers=args.layers).to(self.args.device)
+        self.transition_net = Transition(state_size=self.observation_size, action_size=self.action_size, mask_size=self.action_size, layers=args.layers).to(self.args.device)
+        print(args.base_model + 'policy')
         if(os.path.exists(args.base_model + 'policy')): 
             self.policy_net.load_state_dict(th.load(args.base_model + 'policy'))
             self.target_net.load_state_dict(th.load(args.base_model + 'policy'))
             self.transition_net.load_state_dict(th.load(args.base_model + 'transition'))
-            self.rewarddone_net.load_state_dict(th.load(args.base_model + 'rewarddone'))
-            self.mask_net.load_state_dict(th.load(args.base_model + 'mask_net'))
             self.policy_net.eval()
             self.target_net.eval()
             self.transition_net.eval()
-            self.rewarddone_net.eval()
-            self.mask_net.eval()
 
-
-        self.all_parameters = list(self.policy_net.parameters()) + list(self.transition_net.parameters()) + list(self.rewarddone_net.parameters()) + list(self.mask_net.parameters())
+        self.all_parameters = list(self.policy_net.parameters()) + list(self.transition_net.parameters())
         self.optimizer = optim.Adam(self.all_parameters, lr=args.learning_rate)
     
     def learn(self, total_timesteps):
@@ -146,14 +139,12 @@ class MBDQN():
 
         acts_ohe = F.one_hot(acts, num_classes=self.action_size).squeeze()
         trans_in = th.cat((obs, acts_ohe), 1).float()
-        rewards_pred, dones_pred = self.rewarddone_net(trans_in)
-        rewards_pred = rewards_pred.float().squeeze()
-        dones_pred = dones_pred.float().squeeze()  
-
-        next_obs_pred = self.transition_net(trans_in)
-        next_masks_pred = self.mask_net(trans_in)
-        #dones_pred_clip = (dones_pred>0.5).float()           # values must be 0 or 1
-        #next_masks_pred_clip = (next_masks_pred>0.5).float() # values must be 0 or 1  
+        # state, reward, done, mask 
+        next_obs_pred, rewards_pred, dones_pred, next_masks_pred,  = self.transition_net(trans_in)
+        rewards_pred = rewards_pred.squeeze()
+        dones_pred = rewards_pred.squeeze()
+        dones_pred = (dones_pred>0.9).float()           # values must be 0 or 1
+        next_masks_pred = (next_masks_pred>0.9).float() # values must be 0 or 1  
 
         non_final_mask = th.tensor(tuple(map(lambda s: s != 1, dones_pred)), device=self.device, dtype=th.bool) 
         non_final_next_obs_pred = np.asarray([s for index, s in enumerate(next_obs_pred.cpu().detach().numpy()) if dones_pred[index] != 1])
@@ -162,18 +153,29 @@ class MBDQN():
         non_final_next_masks_pred = np.asarray([s for index, s in enumerate(next_masks_pred.cpu().detach().numpy()) if dones_pred[index] != 1])
         non_final_next_masks_pred = th.from_numpy(non_final_next_masks_pred).to(device=self.device) 
 
+        non_final_next_obs = np.asarray([s for index, s in enumerate(next_obs.cpu().detach().numpy()) if dones[index] != 1])
+        non_final_next_obs = th.from_numpy(non_final_next_obs).to(device=self.device) 
+
+        non_final_next_masks = np.asarray([s for index, s in enumerate(next_masks.cpu().detach().numpy()) if dones[index] != 1])
+        non_final_next_masks = th.from_numpy(non_final_next_masks).to(device=self.device) 
+
+        value_non_final_mask = th.tensor(tuple(map(lambda s: s != 1, dones)), device=self.device, dtype=th.bool) 
+
         # Compute Q(s_t, a) 
-        state_action_values = self.policy_net(obs.float()).gather(dim=1, index=acts).squeeze()
+        policy_in = th.cat((obs.float(), masks.float()), 1)
+        state_action_values = self.policy_net(policy_in).gather(dim=1, index=acts).squeeze()
         # Compute V(s_{t+1})
         next_state_values = th.zeros(self.batch_size, device=self.device)
-        non_final_size = non_final_next_obs_pred.size()[0]
-        if( non_final_size> 0):
-            # max besides zeroed out values 
-            masked_next_state_values = self.target_net(non_final_next_obs_pred.float()) 
-            masked_next_state_values -= masked_next_state_values.min(1, keepdim=True)[0]
-            masked_next_state_values /= masked_next_state_values.max(1, keepdim=True)[0] # normalize to between 0 and 1 
-            masked_next_state_values *= non_final_next_masks_pred
-            next_state_values[non_final_mask] = masked_next_state_values.max(1).values.detach() 
+        non_final_size = non_final_next_obs.size()[0]
+        if( non_final_size > 0):
+            # currently using true values of non final next obs and mask as input to V(s_{t+1}) 
+            target_in = th.cat((non_final_next_obs.float(), non_final_next_masks.float()), 1)
+            masked_next_state_values = self.target_net(target_in) 
+            masked_next_state_indicies = masked_next_state_values - masked_next_state_values.min(1, keepdim=True)[0]
+            masked_next_state_indicies /= masked_next_state_indicies.max(1, keepdim=True)[0] # normalize to between 0 and 1 
+            masked_next_state_indicies *= non_final_next_masks
+            indicies = masked_next_state_indicies.max(1)[1].detach()
+            next_state_values[value_non_final_mask] = masked_next_state_values.gather(1, indicies.view(-1,1)).view(-1)
 
         # Compute the expected Q values
         expected_state_action_values = rewards_pred + (next_state_values * self.gamma) 
@@ -197,25 +199,26 @@ class MBDQN():
 
         if self.training_step % self.target_update == 0: # Set target net to policy net
             self.target_net.load_state_dict(self.policy_net.state_dict()) 
-
+            
     def predict(self, obs, mask):
         sample = np.random.random_sample()
         self.e *= 0.99 if self.e > self.e_min else self.e_min
-        if(sample < self.e and not self.compare):
+        if(sample < self.e):
             actions = np.linspace(0,len(mask)-1,num=len(mask), dtype=np.int32)
             action = np.random.choice([a for action_index, a in enumerate(actions) if mask[action_index] == 1])
         else:
-            if(self.args.model_based):
+            if(self.args.planning):
                 action = best_first_search(self.policy_net, self.transition_net, obs, mask, self.args)
             else:
                 with th.no_grad():
-                    q_values = self.policy_net(th.from_numpy(obs).to(self.args.device)).cpu().numpy()
-                    q_values += np.abs(np.min(q_values))
-                    masked_q_values = np.zeros_like(q_values)
-                    for mask_index in range(mask.shape[0]):
-                        if(mask[mask_index] == 0): continue 
-                        masked_q_values[mask_index] += q_values[mask_index]
-                    action = np.argmax(masked_q_values)
+                    obs_tensor = th.from_numpy(obs).to(self.args.device)
+                    mask_tensor = th.from_numpy(mask).to(self.args.device)
+                    policy_in = th.cat((obs_tensor, mask_tensor))
+                    q_values = self.policy_net(policy_in).cpu().numpy() 
+                    masked_q_values = [q for index, q in enumerate(q_values) if mask[index] == 1]
+                    action = np.where(q_values == np.max(masked_q_values))[0][0]
+
+                    assert(False)
         
         return action
 
@@ -227,26 +230,27 @@ class MBDQN():
         
         th.save(self.policy_net.state_dict(), folder + log_tag + "/policy")
         th.save(self.transition_net.state_dict(), folder + log_tag + "/transition")
-        th.save(self.rewarddone_net.state_dict(), folder + log_tag + "/rewarddone")
-        th.save(self.mask_net.state_dict(), folder + log_tag + "/mask")
     
 
     def compare(self, args):
-        assert(False)
         # load_folder=args.load_folder, opponent=args.opponent
-        self.policy_net = MLP(input_size=self.observation_size, output_size=self.action_size, layers=args.layers).to(self.args.device)
+        self.policy_net = Policy(input_size=self.observation_size, output_size=self.action_size, layers=args.layers).to(self.args.device)
         self.policy_net.load_state_dict(th.load(args.load_folder + 'policy'))
         self.policy_net.eval()
         self.e = 0 
 
-        self.transition_net = MLP(input_size=self.observation_size + self.action_size, output_size=self.observation_size + self.action_size + 2, layers=args.layers).to(self.args.device)
+        self.transition_net = Transition(input_size=self.observation_size + self.action_size, output_size=self.observation_size + self.action_size + 2, layers=args.layers).to(self.args.device)
         self.transition_net.load_state_dict(th.load(args.load_folder + 'transition'))
         self.transition_net.eval()
 
         if(self.args.opponent != "random"):
-            opponent = MLP(input_size=self.observation_size, output_size=self.action_size, layers=args.layers).to(self.args.device)
-            opponent.load_state_dict(th.load(args.load_folder + 'policy'))
-            opponent.eval()
+            opponent_policy = Policy(input_size=self.observation_size, output_size=self.action_size, layers=args.layers).to(self.args.device)
+            opponent_policy.load_state_dict(th.load(args.load_folder + 'policy'))
+            opponent_policy.eval()
+
+            opponent_transition = Transition(input_size=self.observation_size + self.action_size, output_size=self.observation_size + self.action_size + 2, layers=args.layers).to(self.args.device)
+            opponent_transition.load_state_dict(th.load(args.load_folder + 'transition'))
+            opponent_transition.eval()
 
         env = self.env
         env.reset()
@@ -263,17 +267,13 @@ class MBDQN():
 
             if(player_index == args.player_id):
                 action = self.predict(obs=obs, mask=mask)
-                with th.no_grad():
-                    q_values = self.policy_net(th.from_numpy(obs).to(self.args.device)).cpu().numpy()
-                    masked_q_values = -(q_values * -mask)  
-                    action = np.argmax(masked_q_values)
             else:
                 if(self.args.opponent == "random"):
                     actions = np.linspace(0,len(mask)-1,num=len(mask), dtype=np.int32)
                     action = np.random.choice([a for action_index, a in enumerate(actions) if mask[action_index] == 1])
                 else:
                     with th.no_grad():
-                        q_values = opponent(th.from_numpy(obs).to(self.args.device)).cpu().numpy()
+                        q_values = opponent_policy(th.from_numpy(obs).to(self.args.device)).cpu().numpy()
                         masked_q_values = -(q_values * -mask)  
                         action = np.argmax(masked_q_values)
 

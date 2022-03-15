@@ -12,7 +12,7 @@ import torch.optim as optim
 from tqdm import tqdm
 
 from argparse import ArgumentParser
-from tom.models.common.networks import Policy, Transition, Attention, Belief, RewardDone, Mask, MLP
+from tom.models.common.networks import Policy, Transition, Attention, Belief
 from tom.models.common.utils import TOMReplayBuffer
 from tom.models.common.tree_search import best_first_search
 

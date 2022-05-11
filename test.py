@@ -1,11 +1,29 @@
 import os 
 
 
-for model_id in range(0,101):
-    print("model id: ", str(model_id))
-    for player_id in range(0,2):
-        call = "python train.py --compare --model_type MADQN --load_folder ./trained_models/tiktaktoe/MADQN_10K/models-" + str(model_id) + "/ --opponent ./trained_models/tiktaktoe/MADQN_10K/models-100/ --timesteps 100 " + " --player_id " + str(player_id)
-        os.system(call)
+ts = " 100000 "
+pid = " 0 "
+compare_folder = " ./test_results/no_limit_holdem/8_players/TOM/1M_ts/models-17/"
+load_folder = " ./trained_models/no_limit_holdem/8_players/TOM/1M_ts/models-17/"
+opponent = " random "
+num_players = " 8 "
+model_type = " TOM "
+environment = " no_limit_holdem "
+p_depth = " 100 "
 
-        call = "python train.py --compare --model_type MADQN --load_folder ./trained_models/tiktaktoe/MADQN_10K/models-" + str(model_id) + "/ --opponent random --timesteps 100  " + " --player_id " + str(player_id)
-        os.system(call)
+command = "python train.py --compare  "
+command += "--planning_depth " + p_depth
+command += " --player_id " + pid 
+command += " --timesteps  " + ts 
+command += " --compare_folder " + compare_folder 
+command += " --load_folder " + load_folder
+command += " --opponent " + opponent
+command += " --num_players " + num_players
+command += " --model_type " + model_type
+command += " --environment " + environment
+print(command)
+
+os.system(command)
+
+
+

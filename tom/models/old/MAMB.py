@@ -21,9 +21,9 @@ from tom.models.common.tree_search import best_first_search
 
 
 
-class MBDQN():
+class MAMB():
     """
-    Deep Model-Based Q-Network (MADQN)
+    Deep Model-Based Q-Network for multi-agent games (DQN)
     """
 
     def __init__(self, env, args):
@@ -54,14 +54,9 @@ class MBDQN():
         self.e = 1 # start at 100% exploration 
         self.training_step = 0
         self.loss_log = []
-
-        self.prev_mask = [None for _ in env.agents]
-        self.prev_obs  = [None for _ in env.agents]
-        self.prev_action  = [None for _ in env.agents]
-        self.prev_rew  = [None for _ in env.agents]
         
 
-        self.replay_buffer = ReplayBuffer(  buffer_size=int(1e5), 
+        self.replay_buffer = ReplayBuffer(  buffer_size=int(1e6), 
                                             observation_shape=self.observation_size, 
                                             action_shape=(self.action_size,),
                                             belief_shape=())
@@ -69,7 +64,7 @@ class MBDQN():
         self.policy_net = Policy(input_size=self.observation_size + self.action_size, output_size=self.action_size, layers=args.layers).to(self.args.device)
         self.target_net = Policy(input_size=self.observation_size + self.action_size, output_size=self.action_size, layers=args.layers).to(self.args.device)
         self.transition_net = Transition(state_size=self.observation_size, action_size=self.action_size, mask_size=self.action_size, layers=args.layers).to(self.args.device)
-        print(args.base_model + 'policy')
+
         if(os.path.exists(args.base_model + 'policy')): 
             self.policy_net.load_state_dict(th.load(args.base_model + 'policy'))
             self.target_net.load_state_dict(th.load(args.base_model + 'policy'))
@@ -88,12 +83,13 @@ class MBDQN():
         for learning_timestep in tqdm(range(total_timesteps)):
             if(learning_timestep % self.args.log_time == 0 and not self.args.compare):
                 log_tag = "models-" + str(int(learning_timestep / self.args.log_time))
-                self.save(self.args.save_folder, log_tag = log_tag)
+                self.save(self.args.save_folder, log_tag = log_tag) 
+                self.evaluate()
 
             player_index = self.env.agents.index(env.agent_selection)
             obs = env.observe(agent=env.agent_selection)['observation'].flatten().astype(np.float32)
             mask = env.observe(agent=env.agent_selection)['action_mask']
-
+            
             action = self.predict(obs=obs, mask=mask)
             env.step(action) 
             
@@ -102,25 +98,10 @@ class MBDQN():
 
             if(self.prev_rew[player_index] is not None):
                 self.observe(self.prev_obs[player_index], obs, self.prev_action[player_index], self.prev_mask[player_index], mask, self.prev_rew[player_index], done_n[player_index], info_n[player_index])
-            
-            self.prev_obs[player_index]    = obs
-            self.prev_mask[player_index]   = mask
-            self.prev_action[player_index] = action 
-            self.prev_rew[player_index]    = rew_n[player_index]
 
             self.on_step()
 
-            if all(done_n):
-                for agent_index in range(self.num_agents):
-                    mask = env.observe(agent=env.agents[agent_index])['action_mask']
-                    self.observe(self.prev_obs[agent_index], obs_n[agent_index], self.prev_action[agent_index], self.prev_mask[agent_index], mask, rew_n[agent_index], done_n[agent_index], info_n[agent_index])
-                env.reset() 
-                self.prev_mask = [None for _ in env.agents]
-                self.prev_obs  = [None for _ in env.agents]
-                self.prev_action  = [None for _ in env.agents]
-                self.prev_rew  = [None for _ in env.agents]
 
-                
     def observe(self, obs, obs_next, action, mask, mask_next, reward, done, info):
         if(obs is None): return  
         self.replay_buffer.add(obs, obs_next, action, mask, mask_next, reward, done, info) 
@@ -217,9 +198,7 @@ class MBDQN():
                     q_values = self.policy_net(policy_in).cpu().numpy() 
                     masked_q_values = [q for index, q in enumerate(q_values) if mask[index] == 1]
                     action = np.where(q_values == np.max(masked_q_values))[0][0]
-
-                    assert(False)
-        
+                    
         return action
 
      
@@ -227,19 +206,56 @@ class MBDQN():
         import os
         if not os.path.exists(folder + log_tag):
             os.makedirs(folder + log_tag)
-        
+
         th.save(self.policy_net.state_dict(), folder + log_tag + "/policy")
         th.save(self.transition_net.state_dict(), folder + log_tag + "/transition")
     
+    def evaluate(self):
+        env = copy.copy(self.env)
+        env.reset()
+
+        cum_rewards = []
+        eps_rewards = np.zeros(len(self.env.agents))
+
+        for _ in range(10000):
+            player_key = env.agent_selection
+            player_index = env.agents.index(env.agent_selection)
+
+            obs = env.observe(agent=player_key)['observation'].flatten().astype(np.float32)
+            mask = env.observe(agent=player_key)['action_mask']
+
+            #if(False): 
+            if(player_index == self.args.player_id):
+                action = self.predict(obs=obs, mask=mask)
+            else:
+                actions = np.linspace(0,len(mask)-1,num=len(mask), dtype=np.int32)
+                action = np.random.choice([a for action_index, a in enumerate(actions) if mask[action_index] == 1])
+
+            env.step(action) 
+            rew_n, done_n = list(env.rewards.values()), list(env.dones.values())
+            eps_rewards += rew_n
+
+            if all(done_n):
+                env.reset()
+                cum_rewards.append(eps_rewards)
+                eps_rewards = np.zeros(len(self.env.agents))
+        
+        del env
+        cum_rewards = np.array(cum_rewards)
+        print(" Current trained model with pid:  ", self.args.player_id, " mean reward", np.mean(cum_rewards[:,self.args.player_id]))
+        return 
+
+        
 
     def compare(self, args):
         # load_folder=args.load_folder, opponent=args.opponent
-        self.policy_net = Policy(input_size=self.observation_size, output_size=self.action_size, layers=args.layers).to(self.args.device)
+        self.policy_net = Policy(input_size=self.observation_size + self.action_size, output_size=self.action_size, layers=args.layers).to(self.args.device)
         self.policy_net.load_state_dict(th.load(args.load_folder + 'policy'))
         self.policy_net.eval()
         self.e = 0 
 
-        self.transition_net = Transition(input_size=self.observation_size + self.action_size, output_size=self.observation_size + self.action_size + 2, layers=args.layers).to(self.args.device)
+        #self.transition_net = Transition(input_size=self.observation_size + self.action_size, output_size=self.observation_size + self.action_size + 2, layers=args.layers).to(self.args.device)
+        self.transition_net = Transition(state_size=self.observation_size, action_size=self.action_size, mask_size=self.action_size, layers=args.layers).to(self.args.device)
         self.transition_net.load_state_dict(th.load(args.load_folder + 'transition'))
         self.transition_net.eval()
 
@@ -248,7 +264,8 @@ class MBDQN():
             opponent_policy.load_state_dict(th.load(args.load_folder + 'policy'))
             opponent_policy.eval()
 
-            opponent_transition = Transition(input_size=self.observation_size + self.action_size, output_size=self.observation_size + self.action_size + 2, layers=args.layers).to(self.args.device)
+            #opponent_transition = Transition(input_size=self.observation_size + self.action_size, output_size=self.observation_size + self.action_size + 2, layers=args.layers).to(self.args.device)
+            opponent_transition = Transition(state_size=self.observation_size, action_size=self.action_size, mask_size=self.action_size, layers=args.layers).to(self.args.device)
             opponent_transition.load_state_dict(th.load(args.load_folder + 'transition'))
             opponent_transition.eval()
 
@@ -265,6 +282,7 @@ class MBDQN():
             obs = env.observe(agent=player_key)['observation'].flatten().astype(np.float32)
             mask = env.observe(agent=player_key)['action_mask']
 
+            #if(False): 
             if(player_index == args.player_id):
                 action = self.predict(obs=obs, mask=mask)
             else:
@@ -273,9 +291,12 @@ class MBDQN():
                     action = np.random.choice([a for action_index, a in enumerate(actions) if mask[action_index] == 1])
                 else:
                     with th.no_grad():
-                        q_values = opponent_policy(th.from_numpy(obs).to(self.args.device)).cpu().numpy()
-                        masked_q_values = -(q_values * -mask)  
-                        action = np.argmax(masked_q_values)
+                        obs_tensor = th.from_numpy(obs).to(self.args.device)
+                        mask_tensor = th.from_numpy(mask).to(self.args.device)
+                        policy_in = th.cat((obs_tensor, mask_tensor))
+                        q_values = self.policy_net(policy_in).cpu().numpy() 
+                        masked_q_values = [q for index, q in enumerate(q_values) if mask[index] == 1]
+                        action = np.where(q_values == np.max(masked_q_values))[0][0]
 
             env.step(action) 
             rew_n, done_n = list(env.rewards.values()), list(env.dones.values())

@@ -51,7 +51,6 @@ def get_belief_input(env, prev_action, prev_belief):
                     public_cards[idx] = 1
 
         chips = np.array(env.unwrapped.get_perfect_information()['chips'])
-
         return  np.concatenate([prev_belief, prev_action, public_cards, chips])
     else:
         print("Error this environment is not implemented yet")
@@ -64,7 +63,6 @@ class ReplayBuffer():
         buffer_size: int,
         observation_shape: tuple,
         action_shape: tuple,
-        belief_shape: tuple,
         handle_timeout_termination: bool = True,
 
     ):
@@ -150,11 +148,12 @@ class TOMReplayBuffer():
         self.next_observations = np.zeros((self.buffer_size, self.obs_shape), dtype=np.int32)
         self.masks = np.zeros((self.buffer_size, self.n_envs) + action_shape, dtype=np.int32)
         self.next_mask = np.zeros((self.buffer_size, self.n_envs) + action_shape, dtype=np.int32)
-        self.prev_actions = np.zeros((self.buffer_size, self.n_envs, 1), dtype=np.int64)
+        self.prev_actions = np.zeros((self.buffer_size, self.n_envs, num_agents), dtype=np.int64)
         self.beliefs = np.zeros((self.buffer_size, self.n_envs, num_agents - 1) + belief_shape, np.int32) 
         self.prev_beliefs = np.zeros((self.buffer_size, self.n_envs, num_agents - 1) + belief_shape, np.int32) 
         self.rewards = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.dones = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.agent = np.zeros((self.buffer_size, self.n_envs, num_agents), np.int32) 
         self.handle_timeout_termination = handle_timeout_termination
         self.timeouts = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.pos = 0
@@ -169,6 +168,7 @@ class TOMReplayBuffer():
         next_mask:np.ndarray,
         reward: np.ndarray,
         done: np.ndarray,
+        agent: np.ndarray,
         infos: List[Dict[str, Any]],
     ) -> None:
         # Copy to avoid modification by reference 
@@ -181,6 +181,7 @@ class TOMReplayBuffer():
         self.next_mask[self.pos] = np.array(next_mask).copy()
         self.rewards[self.pos] = np.array(reward).copy()
         self.dones[self.pos] = np.array(done).copy()
+        self.agent[self.pos] = np.array(agent).copy()
 
         if self.handle_timeout_termination:
             #self.timeouts[self.pos] = np.array([info.get("TimeLimit.truncated", False) for info in infos])
@@ -200,13 +201,14 @@ class TOMReplayBuffer():
         data = (
             self.normalize_obs(self.observations[batch_inds, :], env),
             self.normalize_obs(self.next_observations[batch_inds, :], env),
-            self.prev_actions[batch_inds, 0, :],
+            self.prev_actions[batch_inds, :],
             self.beliefs[batch_inds, :],
             self.prev_beliefs[batch_inds, :],
             self.masks[batch_inds, 0, :],
             self.next_mask[batch_inds, 0, :],
-            self.dones[batch_inds] * (1 - self.timeouts[batch_inds]),
             self.normalize_reward(self.rewards[batch_inds], env),
+            self.dones[batch_inds] * (1 - self.timeouts[batch_inds]),
+            self.agent[batch_inds, 0, :],
         )
         return tuple(map(self.to_torch, data))
     
@@ -240,11 +242,12 @@ class TOMReplayBuffer():
         self.next_observations = np.zeros((self.buffer_size, self.obs_shape), dtype=np.int32)
         self.masks = np.zeros((self.buffer_size, self.n_envs) + action_shape, dtype=np.int32)
         self.next_mask = np.zeros((self.buffer_size, self.n_envs) + action_shape, dtype=np.int32)
-        self.actions = np.zeros((self.buffer_size, self.n_envs, 1), dtype=np.int64)
         self.prev_actions = np.zeros((self.buffer_size, self.n_envs, num_agents), dtype=np.int64)
-        self.prev_beliefs = np.zeros((self.buffer_size, self.n_envs, num_agents) + belief_shape, np.int32) 
+        self.beliefs = np.zeros((self.buffer_size, self.n_envs, num_agents - 1) + belief_shape, np.int32) 
+        self.prev_beliefs = np.zeros((self.buffer_size, self.n_envs, num_agents - 1) + belief_shape, np.int32) 
         self.rewards = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.dones = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.agent = np.zeros((self.buffer_size, self.n_envs, num_agents), np.int32) 
         self.handle_timeout_termination = handle_timeout_termination
         self.timeouts = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.pos = 0
@@ -252,25 +255,27 @@ class TOMReplayBuffer():
         self,
         obs: np.ndarray,
         next_obs: np.ndarray,
-        action: np.ndarray,
         prev_action: np.ndarray,
+        beliefs:np.ndarray,
         prev_belief: np.ndarray,
         mask:np.ndarray,
         next_mask:np.ndarray,
         reward: np.ndarray,
         done: np.ndarray,
+        agent: np.ndarray,
         infos: List[Dict[str, Any]],
     ) -> None:
         # Copy to avoid modification by reference 
         self.observations[self.pos] = np.array(obs).copy()
         self.next_observations[self.pos] = np.array(next_obs).copy()
-        self.actions[self.pos] = np.array(action).copy()
-        self.prev_actions[self.pos] = np.array(prev_action).copy()    
+        self.prev_actions[self.pos] = np.array(prev_action).copy() 
+        self.beliefs[self.pos] = np.array(beliefs).copy()   
         self.prev_beliefs[self.pos] = np.array(prev_belief).copy()
         self.masks[self.pos] = np.array(mask).copy()
         self.next_mask[self.pos] = np.array(next_mask).copy()
         self.rewards[self.pos] = np.array(reward).copy()
         self.dones[self.pos] = np.array(done).copy()
+        self.agent[self.pos] = np.array(agent).copy()
 
         if self.handle_timeout_termination:
             #self.timeouts[self.pos] = np.array([info.get("TimeLimit.truncated", False) for info in infos])
@@ -290,13 +295,14 @@ class TOMReplayBuffer():
         data = (
             self.normalize_obs(self.observations[batch_inds, :], env),
             self.normalize_obs(self.next_observations[batch_inds, :], env),
-            self.actions[batch_inds, 0, :],
-            self.prev_actions[batch_inds, 0, :],
+            self.prev_actions[batch_inds, :],
+            self.beliefs[batch_inds, :],
             self.prev_beliefs[batch_inds, :],
             self.masks[batch_inds, 0, :],
             self.next_mask[batch_inds, 0, :],
-            self.dones[batch_inds] * (1 - self.timeouts[batch_inds]),
             self.normalize_reward(self.rewards[batch_inds], env),
+            self.dones[batch_inds] * (1 - self.timeouts[batch_inds]),
+            self.agent[batch_inds, 0, :],
         )
         return tuple(map(self.to_torch, data))
     

@@ -15,7 +15,7 @@ from tqdm import tqdm
 import copy
 
 from argparse import ArgumentParser
-from tom.models.common.networks import Policy, TOMTransition, Belief
+from tom.models.common.networks import Policy, FactoredTransition, Belief
 from tom.models.common.utils import ReplayBuffer, TOMReplayBuffer
 from tom.models.common.utils import get_belief_input
 from tom.models.common.tree_search import best_first_search
@@ -24,7 +24,7 @@ from tom.models.common.tree_search import best_first_search
 
 class TOM():
     """
-    Deep Model-Based Theory of Mind for planning 
+    Deep Model-Based Theory of Mind for planning with Factorized Representations 
     """
     def __init__(self, env, args):
         env.reset()
@@ -74,8 +74,11 @@ class TOM():
         self.target_net = Policy(input_size=self.args.state_size + self.action_size, output_size=self.action_size, layers=args.layers).to(self.args.device)
 
         self.inference_net = Policy(input_size=self.args.state_size + self.num_agents, output_size=self.action_size, layers=args.layers).to(self.args.device) # add which player it is?
-        self.transition_net = TOMTransition(state_size=self.args.state_size, action_size=self.action_size, mask_size=self.action_size, belief_size=self.args.belief_in, num_players=len(self.agents)-1, layers=args.layers).to(self.args.device)
-        
+        self.private_transition_net = FactoredTransition(observation_size= self.args.private_size, action_size=self.action_size, layers=args.layers).to(self.args.device)
+        self.belief_transition_net = FactoredTransition(observation_size= self.args.belief_out, action_size=self.action_size, layers=args.layers).to(self.args.device)
+        self.public_transition_net = FactoredTransition(observation_size=  self.args.public_size, action_size=self.action_size, layers=args.layers).to(self.args.device)
+
+
         if(os.path.exists(args.base_model + 'policy')): 
             print(" Loading pretrained models from: ", args.base_model)
             self.policy_net.load_state_dict(th.load(args.base_model + 'policy'))
@@ -126,7 +129,7 @@ class TOM():
             rew_n, done_n, info_n = list(env.rewards.values()), list(env.dones.values()), list(env.infos.values())
             obs_n = [env.observe(agent=agent_id)['observation'].flatten().astype(np.float32) for agent_id in env.agents]
 
-            if(self.prev_rew[player_index] is not None and not None in self.prev_action):
+            if(self.prev_rew[player_index] is not None):
                 player_index_ohe = np.zeros(self.num_agents)
                 player_index_ohe[player_index] = 1
 
@@ -291,8 +294,8 @@ class TOM():
             next_state_values[value_non_final_mask] = masked_next_state_values.gather(1, indicies.view(-1,1)).view(-1)
 
         # Compute the expected Q values
-        expected_state_action_values = rewards + (next_state_values * self.gamma) 
-        state_action_values =  (state_action_values * self.gamma)
+        expected_state_action_values = rewards_pred + (next_state_values * self.gamma) 
+        state_action_values = rewards + (state_action_values * self.gamma)
         
         belief_accuracy = nn.SmoothL1Loss()(beliefs, next_beliefs)
         temporal_difference = nn.MSELoss()(state_action_values, expected_state_action_values) 
@@ -382,7 +385,7 @@ class TOM():
         prev_action  = [None for _ in env.agents]
         prev_belief  = [[None for _ in env.agents] for _ in env.agents]
         
-        for _ in range(10000):
+        for _ in range(1000):
             player_key = env.agent_selection
             player_index = env.agents.index(env.agent_selection)
             obs = env.observe(agent=env.agent_selection)['observation'].flatten().astype(np.float32)
@@ -408,7 +411,7 @@ class TOM():
                 actions = np.linspace(0,len(mask)-1,num=len(mask), dtype=np.int32)
                 action = np.random.choice([a for action_index, a in enumerate(actions) if mask[action_index] == 1])
                 
-            prev_action[player_index] = action 
+            prev_action[agent_idx] = action 
 
             env.step(action) 
             rew_n, done_n = list(env.rewards.values()), list(env.dones.values())

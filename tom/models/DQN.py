@@ -1,38 +1,108 @@
-import os 
+''' DQN agent
 
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+The code is derived from https://github.com/dennybritz/reinforcement-learning/blob/master/DQN/dqn.py
 
-import pandas as pd
+Copyright (c) 2019 Matthew Judell
+Copyright (c) 2019 DATA Lab at Texas A&M University
+Copyright (c) 2016 Denny Britz
 
-import gym
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+'''
+
+import os
+import rlcard
+from rlcard.agents import RandomAgent
+from rlcard.utils import (
+    get_device,
+    set_seed,
+    tournament,
+    reorganize,
+    Logger,
+    plot_curve,
+)
+
+import random
 import numpy as np
-import torch as th
-from torch.nn import functional as F
-from torch import double, nn
-import torch.optim as optim
+import torch
+import torch.nn as nn
+from collections import namedtuple
+from copy import deepcopy
 
-from tqdm import tqdm
-import copy
+from rlcard.utils.utils import remove_illegal
 
-from argparse import ArgumentParser
-from tom.models.common.networks import Policy, TOMTransition, Belief
-from tom.models.common.utils import ReplayBuffer, TOMReplayBuffer
-from tom.models.common.utils import get_belief_input
-from tom.models.common.tree_search import best_first_search
+Transition = namedtuple('Transition', ['state', 'action', 'reward', 'next_state', 'legal_actions', 'done'])
 
+from tom.models.common.rlcard import Estimator, EstimatorNetwork, Memory
 
+class DQN(object):
+    '''
+    Approximate clone of rlcard.agents.dqn_agent.DQN
+    that depends on PyTorch instead of Tensorflow
+    '''
+    def __init__(self,
+                 env,
+                 replay_memory_size=20000,
+                 replay_memory_init_size=100,
+                 update_target_estimator_every=1000,
+                 discount_factor=0.99,
+                 epsilon_start=1.0,
+                 epsilon_end=0.1,
+                 epsilon_decay_steps=20000,
+                 batch_size=32,
+                 train_every=1,
+                 mlp_layers=None,
+                 learning_rate=0.00005,
+                 device=None):
 
-class DQN():
-    """
-    Base DQN
-    """
-    def __init__(self, env, args):
-        env.reset()
+        '''
+        Q-Learning algorithm for off-policy TD control using Function Approximation.
+        Finds the optimal greedy policy while following an epsilon-greedy policy.
+
+        Args:
+            replay_memory_size (int): Size of the replay memory
+            replay_memory_init_size (int): Number of random experiences to sample when initializing
+              the reply memory.
+            update_target_estimator_every (int): Copy parameters from the Q estimator to the
+              target estimator every N steps
+            discount_factor (float): Gamma discount factor
+            epsilon_start (float): Chance to sample a random action when taking an action.
+              Epsilon is decayed over time and this is the start value
+            epsilon_end (float): The final minimum value of epsilon after decaying is done
+            epsilon_decay_steps (int): Number of steps to decay epsilon over
+            batch_size (int): Size of batches to sample from the replay memory
+            evaluate_every (int): Evaluate every N steps
+            num_actions (int): The number of the actions
+            state_space (list): The space of the state vector
+            train_every (int): Train the network every X steps.
+            mlp_layers (list): The layer number and the dimension of each layer in MLP
+            learning_rate (float): The learning rate of the DQN agent.
+            device (torch.device): whether to use the cpu or gpu
+        '''
         self.env = env
-        self.args = args 
-        self.agents = env.agents
-        self.num_agents = len(env.agents)
-        # This self-play algorithm assumes all agents have the same folowing values:
+        self.use_raw = False
+        self.replay_memory_init_size = replay_memory_init_size
+        self.update_target_estimator_every = update_target_estimator_every
+        self.discount_factor = discount_factor
+        self.epsilon_decay_steps = epsilon_decay_steps
+        self.batch_size = batch_size
+        self.train_every = train_every
+
         self.observation_space = self.env.observation_spaces[env.agents[0]]['observation']
         self.action_mask = self.env.observation_spaces[env.agents[0]]['action_mask']
         self.action_space = self.env.action_spaces[env.agents[0]]
@@ -40,357 +110,211 @@ class DQN():
         self.observation_shape = self.observation_space.shape
         self.action_shape      = self.action_space.shape
 
-        self.observation_size = np.prod(self.observation_shape)
-        self.action_size      = self.action_space.n
-        
-        self.planning = args.planning
-        self.device = args.device
-        self.gamma = args.gamma
-        self.batch_size = args.batch_size
-        self.target_update = args.target_update
-        self.layers = args.layers
-        self.model_type = args.model_type
-        self.e_min = 0.05
-        self.e = 1 # start at 100% exploration 
-        self.training_step = 0
-        self.loss_log = []
-
-        self.prev_mask = [None for _ in env.agents]
-        self.prev_obs  = [None for _ in env.agents]
-        self.prev_action  = [None for _ in env.agents]
-        self.prev_rew  = [None for _ in env.agents]
-        self.prev_info  = None
-
-        self.replay_buffer = ReplayBuffer(  buffer_size=int(1e6), 
-                                            observation_shape=self.observation_size, 
-                                            action_shape=(self.action_size,))
-         
-        self.policy_net = Policy(input_size=self.observation_size + self.action_size, output_size=self.action_size, layers=args.layers).to(self.args.device)
-        self.target_net = Policy(input_size=self.observation_size + self.action_size, output_size=self.action_size, layers=args.layers).to(self.args.device)
-
-        if(os.path.exists(args.base_model + 'policy')): 
-            print(" Loading pretrained models from: ", args.base_model)
-            assert(False)
-
-        self.all_parameters = list(self.policy_net.parameters()) 
-        self.optimizer = optim.Adam(self.all_parameters, lr=args.learning_rate)
-    
-    def learn(self, total_timesteps):
-        env = self.env
-        env.reset()
-
-        all_losses = pd.DataFrame()
-
-        for learning_timestep in tqdm(range(total_timesteps)):
-            if(learning_timestep % self.args.log_time == 0 and not self.args.compare):
-                log_tag = "models-" + str(int(learning_timestep / self.args.log_time))
-                self.save(self.args.save_folder, log_tag = log_tag)
-                #self.evaluate()
-
-            player_index = env.agents.index(env.agent_selection)
-            obs = env.observe(agent=env.agent_selection)['observation'].flatten().astype(np.float32)
-            info = env.unwrapped.get_perfect_information()
-
-            mask = env.observe(agent=env.agent_selection)['action_mask']
-
-            action = self.predict(obs=obs, mask=mask)
-            env.step(action) 
-            rew_n, done_n, info_n = list(env.rewards.values()), list(env.dones.values()), list(env.infos.values())
-            obs_n = [env.observe(agent=agent_id)['observation'].flatten().astype(np.float32) for agent_id in env.agents]
-
-            if(self.prev_rew[player_index] is not None):
-                self.observe(   self.prev_obs[player_index], 
-                                obs, 
-                                self.prev_action[player_index],  
-                                self.prev_mask[player_index], 
-                                mask, 
-                                self.prev_rew[player_index], 
-                                done_n[player_index],
-                                info_n[player_index])
-            
-            self.prev_obs[player_index]    = obs
-            self.prev_mask[player_index]   = mask
-            self.prev_action[player_index] = action 
-            self.prev_rew[player_index]    = rew_n[player_index]
-            self.prev_info = info 
-            
-            losses = self.on_step()
-            if(losses is not None):
-                all_losses = all_losses.append(losses, ignore_index=True)
-
-            if all(done_n):
-                for agent_index in range(self.num_agents):
-                    player_index_ohe = np.zeros(self.num_agents)
-                    player_index_ohe[agent_index] = 1
-
-                    mask = env.observe(agent=env.agents[agent_index])['action_mask']
-                    self.observe(   self.prev_obs[agent_index], 
-                                    obs_n[agent_index], 
-                                    self.prev_action[agent_index], 
-                                    self.prev_mask[agent_index], 
-                                    self.prev_mask[player_index], 
-                                    rew_n[agent_index], 
-                                    done_n[agent_index], 
-                                    info_n[agent_index])
-                env.reset() 
-                self.prev_mask = [None for _ in env.agents]
-                self.prev_obs  = [None for _ in env.agents]
-                self.prev_action  = [None for _ in env.agents]
-                self.prev_rew  = [None for _ in env.agents]
-                self.prev_info  = None
-        
-        return all_losses
-
-    
-    def observe(self, obs, obs_next, prev_action, mask, mask_next, reward, done, info):
-        if(obs is None): return  
-        """
-        obs: np.ndarray,
-        next_obs: np.ndarray,
-        prev_action: np.ndarray,
-        mask:np.ndarray,
-        next_mask:np.ndarray,
-        reward: np.ndarray,
-        done: np.ndarray,
-        agent: np.ndarray,
-        infos: List[Dict[str, Any]]
-        """
-        self.replay_buffer.add(obs, obs_next, prev_action, mask, mask_next, reward, done, info) 
-        
-
-    def on_step(self):
-        if self.replay_buffer.size() < self.batch_size:
-            return
-        self.training_step += 1
-        (obs, next_obs, acts, masks, next_masks, rewards, dones) = self.replay_buffer.sample(self.batch_size, self.env)
-        
-        rewards = rewards.float().squeeze() 
-        masks = masks.float().squeeze()
-        dones = dones.float().squeeze()
-        next_masks = next_masks.float().squeeze()
-        next_obs = next_obs.float().squeeze()
-        acts = acts.squeeze()
-
-        state = obs 
-        acts_ohe = F.one_hot(acts, num_classes=self.action_size).squeeze()
-
-        non_final_mask = th.tensor(tuple(map(lambda s: s != 1, dones)), device=self.device, dtype=th.bool) 
-        non_final_next_state_pred = np.asarray([s for index, s in enumerate(next_obs.cpu().detach().numpy()) if dones[index] != 1])
-        non_final_next_state_pred = th.from_numpy(non_final_next_state_pred).to(device=self.device) 
-
-        non_final_next_masks_pred = np.asarray([s for index, s in enumerate(next_masks.cpu().detach().numpy()) if dones[index] != 1])
-        non_final_next_masks_pred = th.from_numpy(non_final_next_masks_pred).to(device=self.device) 
-
-        non_final_next_state = np.asarray([s for index, s in enumerate(next_obs.cpu().detach().numpy()) if dones[index] != 1])
-        non_final_next_state = th.from_numpy(non_final_next_state).to(device=self.device) 
-
-        non_final_next_masks = np.asarray([s for index, s in enumerate(next_masks.cpu().detach().numpy()) if dones[index] != 1])
-        non_final_next_masks = th.from_numpy(non_final_next_masks).to(device=self.device) 
-
-        value_non_final_mask = th.tensor(tuple(map(lambda s: s != 1, dones)), device=self.device, dtype=th.bool) 
-
-        # Compute Q(s_t, a) 
-        policy_in = th.cat((state.float(), masks.float()), 1)
-        state_action_values = self.policy_net(policy_in).gather(dim=1, index=acts.unsqueeze(1)).squeeze()
-        # Compute V(s_{t+1})
-        next_state_values = th.zeros(self.batch_size, device=self.device)
-        non_final_size = non_final_next_state.size()[0]
-        if( non_final_size > 0):
-            # currently using true values of non final next obs and mask as input to V(s_{t+1}) 
-            target_in = th.cat((non_final_next_state.float(), non_final_next_masks.float()), 1)
-            masked_next_state_values = self.target_net(target_in) 
-            masked_next_state_indicies = masked_next_state_values - masked_next_state_values.min(1, keepdim=True)[0]
-            masked_next_state_indicies /= masked_next_state_indicies.max(1, keepdim=True)[0] # normalize to between 0 and 1 
-            masked_next_state_indicies *= non_final_next_masks
-            indicies = masked_next_state_indicies.max(1)[1].detach()
-            next_state_values[value_non_final_mask] = masked_next_state_values.gather(1, indicies.view(-1,1)).view(-1)
-
-        # Compute the expected Q values
-        expected_state_action_values = rewards + (next_state_values * self.gamma) 
-        
-        temporal_difference = nn.MSELoss()(state_action_values, expected_state_action_values) 
-
-        loss = temporal_difference 
-        self.loss_log.append(loss.cpu().detach().numpy())
-
-        # Optimize the model
-        self.optimizer.zero_grad()
-        loss.backward()
-        
-        for param_index, param in enumerate(self.all_parameters):
-            if(param.grad is None): 
-                assert(False) # for testing 
-            param.grad.data.clamp_(-1, 1)
-        self.optimizer.step()
-
-        if self.training_step % self.target_update == 0: # Set target net to policy net
-            self.target_net.load_state_dict(self.policy_net.state_dict()) 
-        
-        if self.training_step % self.args.log_time == 0:
-            #print(state_action_values, expected_state_action_values)
-            #print(rewards, reward_estimation)
-            reward_evaluation = self.evaluate()
-            
-            losses = {  "Temporal Loss": temporal_difference.item(), 
-                        "Evaluate Reward": reward_evaluation}
-            print(losses)
-            return  losses # only calc losses on log time steps 
-
-        return None 
-            
-    def predict(self, obs, mask):
-        sample = np.random.random_sample()
-        self.e *= 0.99 if self.e > self.e_min or self.e == 0 else self.e_min
-        if(sample < self.e):
-            actions = np.linspace(0,len(mask)-1,num=len(mask), dtype=np.int32)
-            action = np.random.choice([a for action_index, a in enumerate(actions) if mask[action_index] == 1])
+        num_actions = self.action_space.n
+        state_shape = np.prod(self.observation_shape)     
+        # Torch device
+        if device is None:
+            self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         else:
-            with th.no_grad():
-                #state_tensor = th.from_numpy(state).to(self.args.device)
-                state_tensor = th.from_numpy(obs).to(self.args.device) 
-                mask_tensor = th.from_numpy(mask).to(self.args.device)
-                policy_in = th.cat((state_tensor, mask_tensor))
-                q_values = self.policy_net(policy_in).cpu().numpy() 
-                masked_q_values = [q for index, q in enumerate(q_values) if mask[index] == 1]
-                try:
-                    action = np.where(q_values == np.max(masked_q_values))[0][0]
-                except Exception as e:
-                    print(q_values)
-                    print(masked_q_values)
-                    actions = np.linspace(0,len(mask)-1,num=len(mask), dtype=np.int32)
-                    action = np.random.choice([a for action_index, a in enumerate(actions) if mask[action_index] == 1])
+            self.device = device
 
-        return action
+        # Total timesteps
+        self.total_t = 0
 
-    def evaluate(self):
-        env = copy.copy(self.env)
-        env.reset()
+        # Total training step
+        self.train_t = 0
 
-        original_e = copy.copy(self.e)
-        self.e = 0 
+        # The epsilon decay scheduler
+        self.epsilons = np.linspace(epsilon_start, epsilon_end, epsilon_decay_steps)
 
-        if(self.args.opponent != "random"):
-            assert(False)
+        # Create estimators
+        self.q_estimator = Estimator(num_actions=num_actions, learning_rate=learning_rate, state_shape=state_shape, \
+            mlp_layers=mlp_layers, device=self.device)
+        self.target_estimator = Estimator(num_actions=num_actions, learning_rate=learning_rate, state_shape=state_shape, \
+            mlp_layers=mlp_layers, device=self.device)
 
-        env = self.env
-        env.reset()
+        # Create replay memory
+        self.memory = Memory(replay_memory_size, batch_size)
 
-        cum_rewards = []
-        eps_rewards = np.zeros(len(self.env.agents))
-
-        prev_action  = [None for _ in env.agents]
-        prev_belief  = [[None for _ in env.agents] for _ in env.agents]
-        
-        for _ in range(10000):
-            player_key = env.agent_selection
-            player_index = env.agents.index(env.agent_selection)
-            obs = env.observe(agent=env.agent_selection)['observation'].flatten().astype(np.float32)
-            mask = env.observe(agent=env.agent_selection)['action_mask']
-
-            if(player_index == self.args.player_id):
-                action = self.predict(obs=obs, mask=mask)
-            else:
-                actions = np.linspace(0,len(mask)-1,num=len(mask), dtype=np.int32)
-                action = np.random.choice([a for action_index, a in enumerate(actions) if mask[action_index] == 1])
-                
-            prev_action[player_index] = action 
-
-            env.step(action) 
-            rew_n, done_n = list(env.rewards.values()), list(env.dones.values())
-            eps_rewards += rew_n
-
-            #print(" Player ", player_index, " with action ", action, " with mask ", mask, " and rewards: ", rew_n)
-
-            if all(done_n):
-                env.reset()
-                cum_rewards.append(eps_rewards)
-                eps_rewards = np.zeros(len(self.env.agents))
-                prev_action  = [None for _ in env.agents]
-                prev_belief  = [[None for _ in env.agents] for _ in env.agents]
-
-        self.e = original_e
-        cum_rewards = np.array(cum_rewards)
-        print(" Player ", self.args.player_id, " mean reward", np.mean(cum_rewards[:,self.args.player_id]))
-        #print(" Players  mean rewards", np.mean(cum_rewards, axis=0))
-        return np.mean(cum_rewards[:,self.args.player_id])
-
-    def save(self, folder, log_tag):
-        import os
-        if not os.path.exists(folder + log_tag):
-            os.makedirs(folder + log_tag)
-        
-        th.save(self.policy_net.state_dict(), folder + log_tag + "/policy")
-    
-
-    def compare(self, args):
-        assert(False)
-        # load_folder=args.load_folder, opponent=args.opponent
-        # load from path file in seperate function 
-        self.belief_net = Belief(input_size=self.args.belief_in, output_size=self.args.belief_out, layers=args.layers).to(self.args.device)
-        self.policy_net = Policy(input_size=self.args.state_size + self.action_size, output_size=self.action_size, layers=args.layers).to(self.args.device)
-        self.transition_net = TOMTransition(state_size=self.args.state_size, action_size=self.action_size, mask_size=self.action_size, belief_size=self.args.belief_in, num_players=len(self.agents)-1, layers=args.layers).to(self.args.device)
-        
-        self.policy_net.load_state_dict(th.load(args.load_folder + 'policy'))
-        self.transition_net.load_state_dict(th.load(args.load_folder + 'transition'))
-        self.belief_net.load_state_dict(th.load(args.load_folder + 'belief'))
-
-        self.policy_net.eval()
-        self.transition_net.eval()
-        self.belief_net.eval()
-
-        self.e = 0 
-
-        if(self.args.opponent != "random"):
-            assert(False)
-
-        env = self.env
-        env.reset()
-
-        cum_rewards = []
-        eps_rewards = np.zeros(len(self.env.agents))
-
-        for _ in tqdm(range(args.timesteps)):
-            player_key = env.agent_selection
-            player_index = env.agents.index(env.agent_selection)
-
-            player_index = env.agents.index(env.agent_selection)
-            obs = env.observe(agent=env.agent_selection)['observation'].flatten().astype(np.float32)
-            state = th.from_numpy(obs).to(self.args.device)
-            info = env.unwrapped.get_perfect_information()
-
-            belief = []
-            for agent_idx, agent in enumerate(env.agents):
-                if(agent != env.agent_selection):
-                    belief_in = get_belief_input(env, self.prev_action[agent_idx], self.prev_belief[player_index][agent_idx])     
-                    belief_in = th.from_numpy(belief_in).to(self.args.device).float()
-                    belief.append(belief_in)
-
-                    belief_out = self.belief_net(belief_in)
-                    self.prev_belief[player_index][agent_idx] = belief_out
-                    state = th.cat([state, belief_out])
+    def train(self, args):
+        # Check whether gpu is available
+        device = get_device()
             
-            mask = env.observe(agent=env.agent_selection)['action_mask']
+        # Seed numpy, torch, random
+        set_seed(args.seed)
 
-            if(player_index == args.player_id):
-                action = self.predict(state=state, mask=mask)
-            else:
-                if(self.args.opponent == "random"):
-                    actions = np.linspace(0,len(mask)-1,num=len(mask), dtype=np.int32)
-                    action = np.random.choice([a for action_index, a in enumerate(actions) if mask[action_index] == 1])
-                else:
-                    with th.no_grad():
-                        assert(False)
-                        q_values = opponent_policy(th.from_numpy(obs).to(self.args.device)).cpu().numpy()
-                        masked_q_values = -(q_values * -mask)  
-                        action = np.argmax(masked_q_values)
+        # Make the environment with seed
+        env = rlcard.make(
+            args.env,
+            config={
+                'seed': args.seed,
+            }
+        )
 
-            env.step(action) 
-            rew_n, done_n = list(env.rewards.values()), list(env.dones.values())
-            eps_rewards += rew_n
+        opponents = []
+        for _ in range(1, env.num_players):
+            opponents.append(RandomAgent(num_actions=env.num_actions))
 
-            if all(done_n):
-                env.reset()
-                cum_rewards.append(eps_rewards)
-                eps_rewards = np.zeros(len(self.env.agents))
+        # Start training
+        with Logger(args.log_dir) as logger:
+            for episode in range(args.num_episodes):
+                # Generate data from the environment
+                trajectories, payoffs = env.run(is_training=True)
+
+                # Reorganaize the data to be state, action, reward, next_state, done
+                trajectories = reorganize(trajectories, payoffs)
+
+                # Feed transitions into agent memory, and train the agent
+                # Here, we assume that DQN always plays the first position
+                # and the other players play randomly (if any)
+                for ts in trajectories[0]:
+                    self.feed(ts)
+
+                # Evaluate the performance. Play with random agents.
+                if episode % args.evaluate_every == 0:
+                    logger.log_performance(
+                        env.timestep,
+                        tournament(
+                            env,
+                            args.num_eval_games,
+                        )[0]
+                    )
+
+            # Get the paths
+            csv_path, fig_path = logger.csv_path, logger.fig_path
+
+        # Plot the learning curve
+        plot_curve(csv_path, fig_path, args.algorithm)
+
+        # Save model
+        save_path = os.path.join(args.log_dir, 'model.pth')
+        self.save(save_path)
+        print('Model saved in', save_path)
+
+    def save(self, save_path):
+        print("not implemented")
+        assert(False)
         
-        return cum_rewards
+    def feed(self, ts):
+        ''' Store data in to replay buffer and train the agent. There are two stages.
+            In stage 1, populate the memory without training
+            In stage 2, train the agent every several timesteps
+
+        Args:
+            ts (list): a list of 5 elements that represent the transition
+        '''
+        (state, action, reward, next_state, done) = tuple(ts)
+        self.feed_memory(state['obs'], action, reward, next_state['obs'], list(state['legal_actions'].keys()), done)
+        self.total_t += 1
+        tmp = self.total_t - self.replay_memory_init_size
+        if tmp>=0 and tmp%self.train_every == 0:
+            self.train()
+
+    def step(self, state):
+        ''' Predict the action for genrating training data but
+            have the predictions disconnected from the computation graph
+
+        Args:
+            state (numpy.array): current state
+
+        Returns:
+            action (int): an action id
+        '''
+        q_values = self.predict(state)
+        epsilon = self.epsilons[min(self.total_t, self.epsilon_decay_steps-1)]
+        legal_actions = list(state['legal_actions'].keys())
+        probs = np.ones(len(legal_actions), dtype=float) * epsilon / len(legal_actions)
+        best_action_idx = legal_actions.index(np.argmax(q_values))
+        probs[best_action_idx] += (1.0 - epsilon)
+        action_idx = np.random.choice(np.arange(len(probs)), p=probs)
+
+        return legal_actions[action_idx]
+
+    def eval_step(self, state):
+        ''' Predict the action for evaluation purpose.
+
+        Args:
+            state (numpy.array): current state
+
+        Returns:
+            action (int): an action id
+            info (dict): A dictionary containing information
+        '''
+        q_values = self.predict(state)
+        best_action = np.argmax(q_values)
+
+        info = {}
+        info['values'] = {state['raw_legal_actions'][i]: float(q_values[list(state['legal_actions'].keys())[i]]) for i in range(len(state['legal_actions']))}
+
+        return best_action, info
+
+    def predict(self, state):
+        ''' Predict the masked Q-values
+
+        Args:
+            state (numpy.array): current state
+
+        Returns:
+            q_values (numpy.array): a 1-d array where each entry represents a Q value
+        '''
+        
+        q_values = self.q_estimator.predict_nograd(np.expand_dims(state['obs'], 0))[0]
+        masked_q_values = -np.inf * np.ones(self.num_actions, dtype=float)
+        legal_actions = list(state['legal_actions'].keys())
+        masked_q_values[legal_actions] = q_values[legal_actions]
+
+        return masked_q_values
+
+    def train(self):
+        ''' Train the network
+
+        Returns:
+            loss (float): The loss of the current batch.
+        '''
+        state_batch, action_batch, reward_batch, next_state_batch, legal_actions_batch, done_batch = self.memory.sample()
+
+        # Calculate best next actions using Q-network (Double DQN)
+        q_values_next = self.q_estimator.predict_nograd(next_state_batch)
+        legal_actions = []
+        for b in range(self.batch_size):
+            legal_actions.extend([i + b * self.num_actions for i in legal_actions_batch[b]])
+        masked_q_values = -np.inf * np.ones(self.num_actions * self.batch_size, dtype=float)
+        masked_q_values[legal_actions] = q_values_next.flatten()[legal_actions]
+        masked_q_values = masked_q_values.reshape((self.batch_size, self.num_actions))
+        best_actions = np.argmax(masked_q_values, axis=1)
+
+        # Evaluate best next actions using Target-network (Double DQN)
+        q_values_next_target = self.target_estimator.predict_nograd(next_state_batch)
+        target_batch = reward_batch + np.invert(done_batch).astype(np.float32) * \
+            self.discount_factor * q_values_next_target[np.arange(self.batch_size), best_actions]
+
+        # Perform gradient descent update
+        state_batch = np.array(state_batch)
+
+        loss = self.q_estimator.update(state_batch, action_batch, target_batch)
+        print('\rINFO - Step {}, rl-loss: {}'.format(self.total_t, loss), end='')
+
+        # Update the target estimator
+        if self.train_t % self.update_target_estimator_every == 0:
+            self.target_estimator = deepcopy(self.q_estimator)
+            print("\nINFO - Copied model parameters to target network.")
+
+        self.train_t += 1
+
+    def feed_memory(self, state, action, reward, next_state, legal_actions, done):
+        ''' Feed transition to memory
+
+        Args:
+            state (numpy.array): the current state
+            action (int): the performed action ID
+            reward (float): the reward received
+            next_state (numpy.array): the next state after performing the action
+            legal_actions (list): the legal actions of the next state
+            done (boolean): whether the episode is finished
+        '''
+        self.memory.save(state, action, reward, next_state, legal_actions, done)
+
+    def set_device(self, device):
+        self.device = device
+        self.q_estimator.device = device
+        self.target_estimator.device = device

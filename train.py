@@ -36,6 +36,36 @@ parser.add_argument('--base_model', default='', type=str,  help='Base model for 
 parser.add_argument('--learning_rate', default=1e-4, type=float,  help='lr for NN')
 parser.add_argument('--num_players', default=2, type=int,  help='Number of players')
 parser.add_argument('--environment', default="no_limit_holdem", type=str,  help='Number of players')
+parser.add_argument(
+        '--cuda',
+        type=str,
+        default='',
+    )
+parser.add_argument(
+    '--seed',
+    type=int,
+    default=42,
+)
+parser.add_argument(
+    '--num_episodes',
+    type=int,
+    default=5000,
+)
+parser.add_argument(
+    '--num_eval_games',
+    type=int,
+    default=5000,
+)
+parser.add_argument(
+    '--evaluate_every',
+    type=int,
+    default=100,
+)
+parser.add_argument(
+    '--log_dir',
+    type=str,
+    default='experiments/leduc-holdem/',
+)
 
 # 118, 52, 418
 parser.add_argument('--belief_in', default=12, type=tuple,  help='Environment specific belief input')
@@ -69,7 +99,11 @@ else:
 # python train
 
 if(args.model_type == "DQN"):
-    model = DQN(env, args)
+    model = DQN(
+            env=env,
+            mlp_layers=args.layers,
+            device=args.device,
+        )
 elif(args.model_type == "TOM"):
     model = TOM(env, args)
 elif(args.model_type == "FTOM"):
